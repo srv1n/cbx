@@ -8,7 +8,11 @@ REPO="${REPO:-srv1n/cbx}"
 VERSION="${VERSION:-}"
 
 print() { printf "%s\n" "$*"; }
-err() { printf "error: %s\n" "$*" >&2; }
+err() {
+  printf "\n\033[1;31m✗ Error:\033[0m %s\n" "$*" >&2
+}
+info() { printf "\033[1;34mℹ\033[0m %s\n" "$*"; }
+success() { printf "\033[1;32m✓\033[0m %s\n" "$*"; }
 
 detect_hf_home() {
   if [[ -n "${HF_HOME:-}" ]]; then
@@ -30,15 +34,34 @@ http_get() {
   local out=$2
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$out" "$url"
+    if ! curl -fsSL -o "$out" "$url" 2>/dev/null; then
+      err "Failed to download: $url"
+      info "This could mean:"
+      info "  • The file hasn't been uploaded to GitHub Releases yet"
+      info "  • The version tag ($VERSION) is incorrect"
+      info "  • Network connectivity issues"
+      info ""
+      info "Expected URL: $url"
+      return 1
+    fi
     return 0
   fi
   if command -v wget >/dev/null 2>&1; then
-    wget -q -O "$out" "$url"
+    if ! wget -q -O "$out" "$url" 2>/dev/null; then
+      err "Failed to download: $url"
+      info "This could mean:"
+      info "  • The file hasn't been uploaded to GitHub Releases yet"
+      info "  • The version tag ($VERSION) is incorrect"
+      info "  • Network connectivity issues"
+      info ""
+      info "Expected URL: $url"
+      return 1
+    fi
     return 0
   fi
 
-  err "neither curl nor wget found"
+  err "Neither curl nor wget found"
+  info "Please install curl or wget to continue"
   return 1
 }
 
@@ -46,7 +69,11 @@ get_latest_version() {
   local api="https://api.github.com/repos/${REPO}/releases/latest"
   local tmp
   tmp="$(mktemp 2>/dev/null || mktemp -t cbx-latest)"
-  http_get "$api" "$tmp"
+
+  if ! http_get "$api" "$tmp"; then
+    rm -f "$tmp" || true
+    return 1
+  fi
 
   local tag
   # Parse `"tag_name": "vX.Y.Z"` from the GitHub API response.
@@ -54,7 +81,8 @@ get_latest_version() {
   tag="$(grep -m1 '\"tag_name\"' "$tmp" | cut -d'"' -f4 || true)"
   rm -f "$tmp" || true
   if [[ -z "${tag}" ]]; then
-    err "failed to determine latest version tag from GitHub API"
+    err "Failed to determine latest version tag from GitHub API"
+    info "Could not parse release information from: $api"
     return 1
   fi
   print "$tag"
@@ -65,15 +93,24 @@ verify_sha256() {
   local sha_file=$2
 
   if command -v shasum >/dev/null 2>&1; then
-    (cd "$(dirname "$file")" && shasum -a 256 -c "$(basename "$sha_file")")
+    if ! (cd "$(dirname "$file")" && shasum -a 256 -c "$(basename "$sha_file")" 2>&1 | grep -q "OK"); then
+      err "SHA256 checksum verification failed for $(basename "$file")"
+      info "The downloaded file may be corrupted or tampered with"
+      return 1
+    fi
     return 0
   fi
   if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$(dirname "$file")" && sha256sum -c "$(basename "$sha_file")")
+    if ! (cd "$(dirname "$file")" && sha256sum -c "$(basename "$sha_file")" 2>&1 | grep -q "OK"); then
+      err "SHA256 checksum verification failed for $(basename "$file")"
+      info "The downloaded file may be corrupted or tampered with"
+      return 1
+    fi
     return 0
   fi
 
-  err "no sha256 verifier found (need shasum or sha256sum)"
+  err "No SHA256 verifier found"
+  info "Please install shasum or sha256sum to verify downloads"
   return 1
 }
 
@@ -82,20 +119,26 @@ main() {
   hf_home="$(detect_hf_home)"
   voice_dir="${hf_home}/cbx/voices"
   if [[ -z "${VERSION}" ]]; then
+    info "Detecting latest version..."
     VERSION="$(get_latest_version)"
   fi
   base_url="https://github.com/${REPO}/releases/download/${VERSION}"
   tmp="$(mktemp -d 2>/dev/null || mktemp -d -t cbx-voice)"
 
-  print "cbx default voice installer"
-  print "  repo:      ${REPO}"
-  print "  version:   ${VERSION}"
-  print "  hf_home:   ${hf_home}"
-  print "  install:   ${voice_dir}"
   print ""
-  print "This installs two profiles:"
-  print "  - default.cbxvoice      (dtype=fp16)"
-  print "  - default-fp32.cbxvoice (dtype=fp32)"
+  print "═══════════════════════════════════════════════════"
+  print "  cbx default voice installer"
+  print "═══════════════════════════════════════════════════"
+  print ""
+  info "Repository:   ${REPO}"
+  info "Version:      ${VERSION}"
+  info "HF Home:      ${hf_home}"
+  info "Install to:   ${voice_dir}"
+  print ""
+  info "This installs two profiles:"
+  print "  • default.cbxvoice      (dtype=fp16)"
+  print "  • default-fp32.cbxvoice (dtype=fp32)"
+  print ""
 
   mkdir -p "${voice_dir}"
 
@@ -105,9 +148,23 @@ main() {
     local out="${tmp}/${name}"
     local sha_out="${tmp}/${name}.sha256"
 
-    http_get "${url}" "${out}"
-    http_get "${sha}" "${sha_out}"
-    verify_sha256 "${out}" "${sha_out}"
+    info "Downloading ${name}..."
+    if ! http_get "${url}" "${out}"; then
+      rm -rf "${tmp}" || true
+      exit 1
+    fi
+
+    info "Downloading checksum..."
+    if ! http_get "${sha}" "${sha_out}"; then
+      rm -rf "${tmp}" || true
+      exit 1
+    fi
+
+    info "Verifying integrity..."
+    if ! verify_sha256 "${out}" "${sha_out}"; then
+      rm -rf "${tmp}" || true
+      exit 1
+    fi
 
     if [[ "${name}" == "cbx-voice-default-fp16.cbxvoice" ]]; then
       cp -f "${out}" "${voice_dir}/default.cbxvoice"
@@ -116,14 +173,21 @@ main() {
     fi
   done
 
+  rm -rf "${tmp}" || true
+
   print ""
-  print "Installed:"
-  print "  ${voice_dir}/default.cbxvoice"
-  print "  ${voice_dir}/default-fp32.cbxvoice"
+  print "═══════════════════════════════════════════════════"
+  success "Installation complete!"
+  print "═══════════════════════════════════════════════════"
   print ""
-  print "Try:"
+  info "Installed files:"
+  print "  • ${voice_dir}/default.cbxvoice"
+  print "  • ${voice_dir}/default-fp32.cbxvoice"
+  print ""
+  info "Try it out:"
   print "  cbx speak --text \"Hello\" --out-wav out.wav"
   print "  cbx speak --dtype fp32 --voice default-fp32 --text \"Hello\" --out-wav out.wav"
+  print ""
 }
 
 main "$@"
